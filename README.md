@@ -1,60 +1,43 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Personal Codex Fork
 
----
+This repository is a personal fork of OpenAI's Codex CLI repository.
 
-## Quickstart
+Upstream Codex is a local coding agent that runs on a developer machine and can inspect, edit, and test code in a workspace. This fork keeps that upstream base, while adding personal workflow changes that are useful for local experimentation and debugging.
 
-### Installing and running Codex CLI
+For upstream project information, documentation, licensing, and installation guidance, see the original OpenAI Codex repository and official Codex documentation.
 
-Install globally with your preferred package manager:
+## Local Usage
 
-```shell
-# Install using npm
-npm install -g @openai/codex
+The personal wrapper is available as:
+
+```bash
+my-codex
 ```
 
-```shell
-# Install using Homebrew
-brew install --cask codex
+In this setup, `my-codex` runs the locally built debug binary from this checkout. Build it with:
+
+```bash
+cd codex-rs
+cargo build -p codex-cli --bin codex
 ```
 
-Then simply run `codex` to get started.
+## Fork Changes
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+### Local Trace Recording
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+This fork adds local trace recording for Codex sessions when tracing is enabled.
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+The `my-codex` wrapper enables tracing by default with `CODEX_TRACE=1`. Traces are written under `codex-traces/` in the active workspace Git repository, or to `CODEX_TRACE_DIR` when that environment variable is set.
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+At a high level, traces record:
 
-</details>
+- session and turn metadata;
+- model requests and responses, including streaming events and usage data;
+- retry relationships between model requests;
+- tool snapshots and tool-call request/result pairs;
+- subagent parent/child trace links;
+- internal/background requests such as compaction and memory-related model calls where wired.
 
-### Using Codex with your ChatGPT plan
+Trace files are grouped for browsing. Model request artifacts live under per-request folders, and tool-call request/result files live under per-tool-call folders.
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+`codex-traces/` is ignored by this fork and should not be committed.
