@@ -21,6 +21,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
 use codex_hooks::Hooks;
+use codex_local_trace::TraceRecorder;
 use codex_login::AuthManager;
 use codex_mcp::McpConnectionManager;
 use codex_models_manager::manager::SharedModelsManager;
@@ -47,6 +48,7 @@ pub(crate) struct SessionServices {
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: ArcSwap<Hooks>,
     pub(crate) rollout_thread_trace: ThreadTraceContext,
+    pub(crate) local_trace_recorder: TraceRecorder,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
     pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,
     pub(crate) show_raw_agent_reasoning: bool,

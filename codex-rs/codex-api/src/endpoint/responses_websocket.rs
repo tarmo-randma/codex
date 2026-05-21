@@ -710,13 +710,30 @@ async fn run_websocket_response_stream(
                     return Err(error);
                 }
 
-                let event = match serde_json::from_str::<ResponsesStreamEvent>(&text) {
+                let raw_event = match serde_json::from_str::<serde_json::Value>(&text) {
                     Ok(event) => event,
                     Err(err) => {
                         debug!("failed to parse websocket event: {err}, data: {text}");
                         continue;
                     }
                 };
+                let event = match serde_json::from_value::<ResponsesStreamEvent>(raw_event.clone())
+                {
+                    Ok(event) => event,
+                    Err(err) => {
+                        debug!("failed to parse websocket event: {err}, data: {text}");
+                        continue;
+                    }
+                };
+                if tx_event
+                    .send(Ok(ResponseEvent::RawProviderEvent(raw_event)))
+                    .await
+                    .is_err()
+                {
+                    return Err(ApiError::Stream(
+                        "response event consumer dropped".to_string(),
+                    ));
+                }
                 let model_verifications = event.model_verifications();
                 if event.kind() == "codex.rate_limits" {
                     if let Some(snapshot) = parse_rate_limit_event(&text) {

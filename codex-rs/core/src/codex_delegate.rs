@@ -46,6 +46,7 @@ use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::session::emit_subagent_session_started;
+use crate::session::local_trace;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_login::AuthManager;
@@ -74,6 +75,17 @@ pub(crate) async fn run_codex_thread_interactive(
 ) -> Result<Codex, CodexErr> {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let local_trace_parent = local_trace::record_subagent_spawn(
+        &parent_session.services.local_trace_recorder,
+        local_trace::subagent_trace_name(&subagent_source),
+        &serde_json::json!({
+            "session_source": SessionSource::SubAgent(subagent_source.clone()).to_string(),
+            "thread_source": format!("{:?}", ThreadSource::Subagent),
+            "cwd": config.cwd.to_string_lossy(),
+            "model": config.model.as_deref(),
+            "model_provider_id": config.model_provider_id.as_str(),
+        }),
+    );
     let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
         config,
         installation_id: parent_session.installation_id.clone(),
@@ -95,6 +107,7 @@ pub(crate) async fn run_codex_thread_interactive(
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
+        local_trace_parent,
         parent_trace: None,
         environment_selections: parent_ctx.environments.clone(),
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),

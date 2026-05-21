@@ -180,6 +180,113 @@ async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
 }
 
 #[tokio::test]
+async fn run_codex_thread_interactive_nests_local_trace_under_parent() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let trace_dir = temp_dir.path().join("traces");
+    let trace_config = trace_config_for_dir(&trace_dir);
+
+    let child = crate::session::local_trace::with_trace_config_for_tests(
+        trace_config,
+        Box::pin(async {
+            let (parent_session, parent_ctx, _rx_events) =
+                crate::session::tests::make_session_and_context_with_rx().await;
+
+            run_codex_thread_interactive(
+                parent_ctx.config.as_ref().clone(),
+                Arc::clone(&parent_session.services.auth_manager),
+                Arc::clone(&parent_session.services.models_manager),
+                Arc::clone(&parent_session),
+                parent_ctx,
+                CancellationToken::new(),
+                SubAgentSource::Review,
+                /*initial_history*/ None,
+            )
+            .await
+            .expect("spawn delegate child")
+        }),
+    )
+    .await;
+
+    let entries = trace_session_dirs(&trace_dir);
+    assert_eq!(entries.len(), 1);
+    let parent_dir = &entries[0];
+    let spawn_entries = trace_json_files(&parent_dir.join("subagents"));
+    assert_eq!(spawn_entries.len(), 1);
+    let child_entries = trace_session_dirs(&parent_dir.join("subagent-sessions"));
+    assert_eq!(child_entries.len(), 1);
+    let child_dir = &child_entries[0];
+    let child_relative_path = child_dir
+        .strip_prefix(parent_dir)
+        .expect("child relative to parent")
+        .to_string_lossy();
+    let child_session: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(child_dir.join("session.json")).unwrap())
+            .expect("child session json");
+    assert_eq!(
+        child_session
+            .get("parent_spawn_path")
+            .and_then(serde_json::Value::as_str),
+        Some(
+            spawn_entries[0]
+                .strip_prefix(parent_dir)
+                .expect("spawn relative to parent")
+                .to_string_lossy()
+                .trim_start_matches('/')
+        )
+    );
+    let spawn_record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&spawn_entries[0]).unwrap())
+            .expect("spawn json");
+    assert_eq!(
+        spawn_record
+            .pointer("/metadata/nested_trace_path")
+            .and_then(serde_json::Value::as_str),
+        Some(child_relative_path.as_ref())
+    );
+
+    child
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown delegate child");
+}
+
+fn trace_session_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn trace_config_for_dir(trace_dir: &std::path::Path) -> codex_local_trace::TraceConfig {
+    codex_local_trace::TraceConfig::from_env_map([
+        ("CODEX_TRACE".to_string(), "1".to_string()),
+        (
+            "CODEX_TRACE_DIR".to_string(),
+            trace_dir.to_string_lossy().to_string(),
+        ),
+    ])
+}
+
+fn trace_json_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;

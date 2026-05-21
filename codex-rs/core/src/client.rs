@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -111,11 +112,26 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::client_local_trace::LocalHttpRequestTrace;
+use crate::client_local_trace::LocalHttpRequestTraceState;
+use crate::client_local_trace::LocalTraceRequest;
+use crate::client_local_trace::LocalTraceRequestTelemetry;
+use crate::client_local_trace::LocalTraceTurn;
+use crate::client_local_trace::LocalWebsocketRequestTraceState;
+use crate::client_local_trace::ModelRequestTraceContext;
+use crate::client_local_trace::start_turn_owner_for_prompt;
 use crate::feedback_tags;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::map_api_error;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
+use codex_local_trace::TraceRecorder;
+use codex_local_trace::recorder::TraceOwner;
+use codex_local_trace::schema::OwnerMetadata;
+use codex_local_trace::schema::OwnerStatus;
+use codex_local_trace::schema::RequestMetadata;
+use codex_local_trace::schema::RequestStatus;
+use codex_local_trace::schema::RequestUpdate;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_model_provider::SharedModelProvider;
@@ -176,6 +192,7 @@ struct ModelClientState {
     beta_features_header: Option<String>,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
+    local_trace_recorder: TraceRecorder,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -244,6 +261,9 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    local_trace_turn: Option<LocalTraceTurn>,
+    current_model_request_trace: Arc<StdMutex<Option<ModelRequestTraceContext>>>,
+    websocket_request_trace_state: Arc<StdMutex<LocalWebsocketRequestTraceState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +341,7 @@ impl ModelClient {
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
+        local_trace_recorder: TraceRecorder,
     ) -> Self {
         let model_provider = create_model_provider(provider_info, auth_manager);
         let codex_api_key_env_enabled = model_provider
@@ -345,6 +366,7 @@ impl ModelClient {
                 beta_features_header,
                 include_attestation,
                 attestation_provider,
+                local_trace_recorder,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
@@ -360,6 +382,11 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
+            local_trace_turn: None,
+            current_model_request_trace: Arc::new(StdMutex::new(None)),
+            websocket_request_trace_state: Arc::new(StdMutex::new(
+                LocalWebsocketRequestTraceState::default(),
+            )),
         }
     }
 
@@ -443,16 +470,6 @@ impl ModelClient {
         }
         let client_setup = self.current_client_setup().await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
-        let request_telemetry = Self::build_request_telemetry(
-            session_telemetry,
-            AuthRequestTelemetryContext::new(
-                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
-                PendingUnauthorizedRetry::default(),
-            ),
-            RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
-            self.state.auth_env_telemetry.clone(),
-        );
         let request = self.build_responses_request(
             &client_setup.api_provider,
             prompt,
@@ -502,14 +519,32 @@ impl ModelClient {
         if let Some(header_value) = self.generate_attestation_header_for().await {
             extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
         }
+        let trace_attempt = compaction_trace.start_attempt(&payload);
+        let local_trace = self.local_compaction_request_trace(model_info.slug.as_str(), &payload);
+        let request_telemetry = Self::build_request_telemetry(
+            session_telemetry,
+            AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                PendingUnauthorizedRetry::default(),
+            ),
+            RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
+            self.state.auth_env_telemetry.clone(),
+            local_trace.clone(),
+        );
         let client =
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
-        let trace_attempt = compaction_trace.start_attempt(&payload);
         let result = client
             .compact_input(&payload, extra_headers)
             .await
             .map_err(map_api_error);
+        self.finish_unary_local_trace_request(
+            local_trace.as_ref(),
+            result
+                .as_ref()
+                .map(|response| serde_json::json!({ "output": response })),
+        );
         trace_attempt.record_result(result.as_deref());
         result
     }
@@ -562,20 +597,6 @@ impl ModelClient {
 
         let client_setup = self.current_client_setup().await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
-        let request_telemetry = Self::build_request_telemetry(
-            session_telemetry,
-            AuthRequestTelemetryContext::new(
-                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
-                PendingUnauthorizedRetry::default(),
-            ),
-            RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
-            self.state.auth_env_telemetry.clone(),
-        );
-        let client =
-            ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
-                .with_telemetry(Some(request_telemetry));
-
         let payload = ApiMemorySummarizeInput {
             model: model_info.slug.clone(),
             raw_memories,
@@ -585,10 +606,40 @@ impl ModelClient {
             }),
         };
 
-        client
+        let local_trace = self.local_memory_request_trace(model_info.slug.as_str(), &payload);
+        let request_telemetry = Self::build_request_telemetry(
+            session_telemetry,
+            AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                PendingUnauthorizedRetry::default(),
+            ),
+            RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
+            self.state.auth_env_telemetry.clone(),
+            local_trace.clone(),
+        );
+        let client =
+            ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry));
+        let result = client
             .summarize_input(&payload, self.build_subagent_headers())
             .await
-            .map_err(map_api_error)
+            .map_err(map_api_error);
+        self.finish_unary_local_trace_request(
+            local_trace.as_ref(),
+            result.as_ref().map(|response| {
+                serde_json::json!({
+                    "output": response
+                        .iter()
+                        .map(|item| serde_json::json!({
+                            "raw_memory": &item.raw_memory,
+                            "memory_summary": &item.memory_summary,
+                        }))
+                        .collect::<Vec<_>>()
+                })
+            }),
+        );
+        result
     }
 
     fn build_subagent_headers(&self) -> ApiHeaderMap {
@@ -676,6 +727,7 @@ impl ModelClient {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        local_trace: Option<LocalHttpRequestTrace>,
     ) -> Arc<dyn RequestTelemetry> {
         let telemetry = Arc::new(ApiTelemetry::new(
             session_telemetry.clone(),
@@ -683,8 +735,13 @@ impl ModelClient {
             request_route_telemetry,
             auth_env_telemetry,
         ));
-        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry;
-        request_telemetry
+        match local_trace {
+            Some(local_trace) => Arc::new(LocalTraceRequestTelemetry {
+                inner: telemetry,
+                local_trace,
+            }),
+            None => telemetry,
+        }
     }
 
     fn build_reasoning(
@@ -763,6 +820,117 @@ impl ModelClient {
             )])),
         };
         Ok(request)
+    }
+
+    fn local_compaction_request_trace(
+        &self,
+        model: &str,
+        payload: &impl serde::Serialize,
+    ) -> Option<LocalHttpRequestTrace> {
+        let recorder = self.state.local_trace_recorder.clone();
+        if !recorder.is_enabled() {
+            return None;
+        }
+        let owner =
+            recorder.start_compaction_call_scope(Some("compaction"), OwnerMetadata::default())?;
+        let Ok(payload_value) = serde_json::to_value(payload) else {
+            recorder.finish_owner_scope(
+                &owner,
+                OwnerStatus::Failed,
+                Some("failed to serialize compaction request".to_string()),
+            );
+            return None;
+        };
+        let tool_snapshot = payload_value
+            .get("tools")
+            .and_then(|tools| recorder.record_tool_snapshot("model-request", tools));
+        Some(LocalHttpRequestTrace {
+            recorder,
+            metadata: RequestMetadata {
+                retry_attempt: Some(1),
+                provider: Some(self.state.provider.info().name.clone()),
+                endpoint: Some(RESPONSES_COMPACT_ENDPOINT.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+            tool_snapshot,
+            payload: payload_value,
+            owner: Some(owner),
+            finish_owner_on_terminal: true,
+            current_model_request_trace: Arc::new(StdMutex::new(None)),
+            state: Arc::new(StdMutex::new(LocalHttpRequestTraceState::default())),
+        })
+    }
+
+    fn local_memory_request_trace(
+        &self,
+        model: &str,
+        payload: &impl serde::Serialize,
+    ) -> Option<LocalHttpRequestTrace> {
+        let recorder = self.state.local_trace_recorder.clone();
+        if !recorder.is_enabled() {
+            return None;
+        }
+        let owner = recorder
+            .start_background_call_scope(Some("memory-summarize"), OwnerMetadata::default())?;
+        let Ok(payload) = serde_json::to_value(payload) else {
+            recorder.finish_owner_scope(
+                &owner,
+                OwnerStatus::Failed,
+                Some("failed to serialize memory summarize request".to_string()),
+            );
+            return None;
+        };
+        Some(LocalHttpRequestTrace {
+            recorder,
+            metadata: RequestMetadata {
+                retry_attempt: Some(1),
+                provider: Some(self.state.provider.info().name.clone()),
+                endpoint: Some(MEMORIES_SUMMARIZE_ENDPOINT.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+            payload,
+            tool_snapshot: None,
+            owner: Some(owner),
+            finish_owner_on_terminal: true,
+            current_model_request_trace: Arc::new(StdMutex::new(None)),
+            state: Arc::new(StdMutex::new(LocalHttpRequestTraceState::default())),
+        })
+    }
+
+    fn finish_unary_local_trace_request(
+        &self,
+        local_trace: Option<&LocalHttpRequestTrace>,
+        response: std::result::Result<serde_json::Value, &CodexErr>,
+    ) {
+        let Some(local_trace) = local_trace else {
+            return;
+        };
+        match response {
+            Ok(response) => {
+                if let Some(trace_request) = local_trace.successful_request() {
+                    trace_request
+                        .recorder
+                        .record_model_response(&trace_request.id, &response);
+                    trace_request.recorder.finish_model_request(
+                        &trace_request.id,
+                        RequestUpdate {
+                            status: Some(RequestStatus::Completed),
+                            ..Default::default()
+                        },
+                    );
+                }
+                local_trace.finish_owner(OwnerStatus::Completed, None);
+            }
+            Err(err) => {
+                if let Some(trace_request) = local_trace.successful_request() {
+                    trace_request.record_failed(&err.to_string(), None);
+                } else {
+                    local_trace.finish_owner(OwnerStatus::Failed, Some(err.to_string()));
+                }
+            }
+        }
     }
 
     /// Returns whether the Responses-over-WebSocket transport is active for this session.
@@ -924,6 +1092,10 @@ impl ModelClient {
 
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
+        self.finish_local_trace_turn(
+            OwnerStatus::Interrupted,
+            Some("model client session dropped before turn completion".to_string()),
+        );
         let websocket_session = std::mem::take(&mut self.websocket_session);
         self.client
             .store_cached_websocket_session(websocket_session);
@@ -931,6 +1103,57 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) fn start_local_trace_turn(&mut self, prompt: &str, codex_turn_id: Option<String>) {
+        if self.local_trace_turn.is_some() {
+            return;
+        }
+        let recorder = &self.client.state.local_trace_recorder;
+        if !recorder.is_enabled() {
+            return;
+        }
+        let Some(owner) = recorder.start_turn_scope(
+            prompt,
+            OwnerMetadata {
+                codex_turn_id,
+                label: None,
+            },
+        ) else {
+            return;
+        };
+        self.local_trace_turn = Some(LocalTraceTurn {
+            owner,
+            finished: false,
+        });
+    }
+
+    pub(crate) fn finish_local_trace_turn(&mut self, status: OwnerStatus, error: Option<String>) {
+        let Some(turn) = self.local_trace_turn.as_mut() else {
+            return;
+        };
+        if turn.finished {
+            return;
+        }
+        self.client
+            .state
+            .local_trace_recorder
+            .finish_owner_scope(&turn.owner, status, error);
+        turn.finished = true;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn current_model_request_trace_context(&self) -> Option<ModelRequestTraceContext> {
+        self.current_model_request_trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn shared_model_request_trace_context(
+        &self,
+    ) -> Arc<StdMutex<Option<ModelRequestTraceContext>>> {
+        Arc::clone(&self.current_model_request_trace)
+    }
+
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
@@ -1217,12 +1440,14 @@ impl ModelClientSession {
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
         inference_trace: &InferenceTraceContext,
+        local_trace_owner: Option<&TraceOwner>,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut local_trace = None;
         loop {
             let client_setup = self.client.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
@@ -1230,12 +1455,6 @@ impl ModelClientSession {
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
                 pending_retry,
-            );
-            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
-                session_telemetry,
-                request_auth_context,
-                RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
-                self.client.state.auth_env_telemetry.clone(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
             let mut options = self
@@ -1250,6 +1469,16 @@ impl ModelClientSession {
                 summary,
                 service_tier.clone(),
             )?;
+            if local_trace.is_none() {
+                local_trace = self.local_http_request_trace(prompt, &request, local_trace_owner);
+            }
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                self.client.state.auth_env_telemetry.clone(),
+                local_trace.clone(),
+            );
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
@@ -1263,10 +1492,19 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
+                    let trace_request = local_trace
+                        .as_ref()
+                        .and_then(LocalHttpRequestTrace::successful_request);
+                    if trace_request.is_none()
+                        && let Some(local_trace) = local_trace.as_ref()
+                    {
+                        local_trace.finish_owner(OwnerStatus::Completed, None);
+                    }
                     let (stream, _) = map_response_stream(
                         stream,
                         session_telemetry.clone(),
                         inference_trace_attempt,
+                        trace_request,
                     );
                     return Ok(stream);
                 }
@@ -1280,14 +1518,23 @@ impl ModelClientSession {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
-                    pending_retry = PendingUnauthorizedRetry::from_recovery(
-                        handle_unauthorized(
-                            unauthorized_transport,
-                            &mut auth_recovery,
-                            session_telemetry,
-                        )
-                        .await?,
-                    );
+                    let recovery = match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut auth_recovery,
+                        session_telemetry,
+                    )
+                    .await
+                    {
+                        Ok(recovery) => recovery,
+                        Err(err) => {
+                            if let Some(local_trace) = local_trace.as_ref() {
+                                local_trace
+                                    .finish_owner(OwnerStatus::Failed, Some(err.to_string()));
+                            }
+                            return Err(err);
+                        }
+                    };
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(recovery);
                     continue;
                 }
                 Err(err) => {
@@ -1299,6 +1546,9 @@ impl ModelClientSession {
                         response_debug_context.request_id.as_deref(),
                         /*output_items*/ &[],
                     );
+                    if let Some(local_trace) = local_trace.as_ref() {
+                        local_trace.finish_owner(OwnerStatus::Failed, Some(err.to_string()));
+                    }
                     return Err(err);
                 }
             }
@@ -1332,6 +1582,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        local_trace_owner: Option<&TraceOwner>,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.provider.auth_manager();
 
@@ -1393,20 +1644,44 @@ impl ModelClientSession {
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
                 )) if status == StatusCode::UNAUTHORIZED => {
-                    pending_retry = PendingUnauthorizedRetry::from_recovery(
-                        handle_unauthorized(
-                            unauthorized_transport,
-                            &mut auth_recovery,
-                            session_telemetry,
-                        )
-                        .await?,
-                    );
+                    let recovery = match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut auth_recovery,
+                        session_telemetry,
+                    )
+                    .await
+                    {
+                        Ok(recovery) => recovery,
+                        Err(err) => {
+                            self.finish_websocket_prerequest_local_trace_owner(
+                                local_trace_owner,
+                                &err,
+                            );
+                            return Err(err);
+                        }
+                    };
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(recovery);
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => {
+                    let err = map_api_error(err);
+                    self.finish_websocket_prerequest_local_trace_owner(local_trace_owner, &err);
+                    return Err(err);
+                }
             }
 
             let mut ws_request = self.prepare_websocket_request(ws_payload, &request);
+            let full_context_request = match &ws_request {
+                ResponsesWsRequest::ResponseCreate(payload)
+                    if payload.previous_response_id.is_some() =>
+                {
+                    let mut full_payload = ResponseCreateWsRequest::from(&request);
+                    full_payload.client_metadata = payload.client_metadata.clone();
+                    Some(ResponsesWsRequest::ResponseCreate(full_payload))
+                }
+                ResponsesWsRequest::ResponseCreate(_)
+                | ResponsesWsRequest::ResponseProcessed(_) => None,
+            };
             self.websocket_session.last_request = Some(request);
             let inference_trace_attempt = if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
@@ -1416,13 +1691,33 @@ impl ModelClientSession {
                 inference_trace.start_attempt()
             };
             stamp_ws_stream_request_start_ms(&mut ws_request);
+            let mut full_context_request = full_context_request;
+            if let Some(full_context_request) = &mut full_context_request {
+                stamp_ws_stream_request_start_ms(full_context_request);
+            }
+            let trace_request = (!warmup)
+                .then(|| {
+                    self.record_websocket_model_request(
+                        prompt,
+                        &ws_request,
+                        full_context_request.as_ref(),
+                        model_info,
+                        local_trace_owner,
+                    )
+                })
+                .flatten();
             inference_trace_attempt.record_started(&ws_request);
-            let websocket_connection =
-                self.websocket_session.connection.as_ref().ok_or_else(|| {
-                    map_api_error(ApiError::Stream(
+            let websocket_connection = match self.websocket_session.connection.as_ref() {
+                Some(websocket_connection) => websocket_connection,
+                None => {
+                    let err = map_api_error(ApiError::Stream(
                         "websocket connection is unavailable".to_string(),
-                    ))
-                })?;
+                    ));
+                    record_websocket_stream_request_failed(&trace_request, &err, None);
+                    inference_trace_attempt.record_failed(&err, None, /*output_items*/ &[]);
+                    return Err(err);
+                }
+            };
             let stream_result = websocket_connection
                 .stream_request(ws_request, self.websocket_session.connection_reused())
                 .await
@@ -1430,6 +1725,11 @@ impl ModelClientSession {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
                     let err = map_api_error(err);
+                    record_websocket_stream_request_failed(
+                        &trace_request,
+                        &err,
+                        response_debug_context.request_id.as_deref(),
+                    );
                     inference_trace_attempt.record_failed(
                         &err,
                         response_debug_context.request_id.as_deref(),
@@ -1441,9 +1741,24 @@ impl ModelClientSession {
                 stream_result,
                 session_telemetry.clone(),
                 inference_trace_attempt,
+                trace_request,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
+        }
+    }
+
+    fn finish_websocket_prerequest_local_trace_owner(
+        &self,
+        local_trace_owner: Option<&TraceOwner>,
+        err: &CodexErr,
+    ) {
+        if let Some(owner) = local_trace_owner {
+            self.client.state.local_trace_recorder.finish_owner_scope(
+                owner,
+                OwnerStatus::Failed,
+                Some(err.to_string()),
+            );
         }
     }
 
@@ -1453,6 +1768,7 @@ impl ModelClientSession {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        local_trace: Option<LocalHttpRequestTrace>,
     ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
         let telemetry = Arc::new(ApiTelemetry::new(
             session_telemetry.clone(),
@@ -1460,9 +1776,141 @@ impl ModelClientSession {
             request_route_telemetry,
             auth_env_telemetry,
         ));
-        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
+        let request_telemetry: Arc<dyn RequestTelemetry> = match local_trace {
+            Some(local_trace) => Arc::new(LocalTraceRequestTelemetry {
+                inner: telemetry.clone(),
+                local_trace,
+            }),
+            None => telemetry.clone(),
+        };
         let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
         (request_telemetry, sse_telemetry)
+    }
+
+    fn local_http_request_trace(
+        &self,
+        prompt: &Prompt,
+        request: &ResponsesApiRequest,
+        local_trace_owner: Option<&TraceOwner>,
+    ) -> Option<LocalHttpRequestTrace> {
+        let recorder = self.client.state.local_trace_recorder.clone();
+        if !recorder.is_enabled() {
+            return None;
+        }
+        let payload = serde_json::to_value(request).ok()?;
+        let (owner, finish_owner_on_terminal) =
+            self.local_trace_owner_for_prompt(&recorder, prompt, local_trace_owner);
+        let tool_snapshot = recorder.record_tool_snapshot("model-request", &request.tools);
+        Some(LocalHttpRequestTrace {
+            recorder,
+            metadata: RequestMetadata {
+                provider: Some(self.client.state.provider.info().name.clone()),
+                endpoint: Some(RESPONSES_ENDPOINT.to_string()),
+                model: Some(request.model.clone()),
+                ..Default::default()
+            },
+            tool_snapshot,
+            payload,
+            owner,
+            finish_owner_on_terminal,
+            current_model_request_trace: Arc::clone(&self.current_model_request_trace),
+            state: Arc::new(StdMutex::new(LocalHttpRequestTraceState::default())),
+        })
+    }
+
+    fn local_trace_owner_for_prompt(
+        &self,
+        recorder: &TraceRecorder,
+        prompt: &Prompt,
+        local_trace_owner: Option<&TraceOwner>,
+    ) -> (Option<TraceOwner>, bool) {
+        if let Some(owner) = local_trace_owner {
+            return (Some(owner.clone()), true);
+        }
+        if let Some(turn) = &self.local_trace_turn {
+            return (Some(turn.owner.clone()), false);
+        }
+        (start_turn_owner_for_prompt(recorder, prompt), true)
+    }
+
+    fn record_websocket_model_request(
+        &self,
+        prompt: &Prompt,
+        request: &ResponsesWsRequest,
+        full_context_request: Option<&ResponsesWsRequest>,
+        model_info: &ModelInfo,
+        local_trace_owner: Option<&TraceOwner>,
+    ) -> Option<LocalTraceRequest> {
+        let recorder = &self.client.state.local_trace_recorder;
+        if !recorder.is_enabled() {
+            return None;
+        }
+        let tools = match request {
+            ResponsesWsRequest::ResponseCreate(payload) => &payload.tools,
+            ResponsesWsRequest::ResponseProcessed(_) => return None,
+        };
+        let (owner, finish_owner_on_terminal) =
+            self.local_trace_owner_for_prompt(recorder, prompt, local_trace_owner);
+        let tool_snapshot = recorder.record_tool_snapshot("model-request", tools);
+        let (retry_attempt, previous_attempt_id, previous_attempt_path) = {
+            let mut state = self
+                .websocket_request_trace_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let retry_attempt = state.next_retry_attempt.max(1);
+            state.next_retry_attempt = retry_attempt.saturating_add(1);
+            (
+                retry_attempt,
+                state.previous_attempt_id.clone(),
+                state.previous_attempt_path.clone(),
+            )
+        };
+        let metadata = RequestMetadata {
+            retry_attempt: Some(retry_attempt),
+            previous_attempt_id,
+            previous_attempt_path,
+            provider: Some(self.client.state.provider.info().name.clone()),
+            endpoint: Some(RESPONSES_ENDPOINT.to_string()),
+            model: Some(model_info.slug.clone()),
+            ..Default::default()
+        };
+        let trace_request = match &owner {
+            Some(owner) => recorder.record_model_request_for_owner(
+                owner,
+                metadata,
+                tool_snapshot.as_ref(),
+                request,
+            ),
+            None => recorder.record_model_request(metadata, tool_snapshot.as_ref(), request),
+        };
+        let Some(trace_request) = trace_request else {
+            if let Some(owner) = &owner {
+                recorder.finish_owner_scope(
+                    owner,
+                    OwnerStatus::Failed,
+                    Some("failed to record websocket model request".to_string()),
+                );
+            }
+            return None;
+        };
+        if let Some(full_context_request) = full_context_request {
+            recorder.record_request_full_context(&trace_request, full_context_request);
+        }
+        *self
+            .current_model_request_trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(ModelRequestTraceContext {
+            id: trace_request.id.clone(),
+            path: trace_request.path.clone(),
+            owner: owner.clone(),
+        });
+        Some(LocalTraceRequest::new(
+            recorder.clone(),
+            trace_request,
+            owner,
+            finish_owner_on_terminal,
+            Some(Arc::clone(&self.websocket_request_trace_state)),
+        ))
     }
 
     /// Builds telemetry for the Responses API WebSocket transport.
@@ -1513,6 +1961,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                /*local_trace_owner*/ None,
             )
             .await
         {
@@ -1555,6 +2004,60 @@ impl ModelClientSession {
         turn_metadata_header: Option<&str>,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_inner(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            turn_metadata_header,
+            inference_trace,
+            /*local_trace_owner*/ None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_with_local_trace_owner(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        turn_metadata_header: Option<&str>,
+        inference_trace: &InferenceTraceContext,
+        local_trace_owner: TraceOwner,
+    ) -> Result<ResponseStream> {
+        self.stream_inner(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            turn_metadata_header,
+            inference_trace,
+            Some(&local_trace_owner),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_inner(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        turn_metadata_header: Option<&str>,
+        inference_trace: &InferenceTraceContext,
+        local_trace_owner: Option<&TraceOwner>,
+    ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -1572,6 +2075,7 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            local_trace_owner,
                         )
                         .await?
                     {
@@ -1591,6 +2095,7 @@ impl ModelClientSession {
                     service_tier,
                     turn_metadata_header,
                     inference_trace,
+                    local_trace_owner,
                 )
                 .await
             }
@@ -1716,6 +2221,7 @@ fn map_response_stream(
     api_stream: codex_api::ResponseStream,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
+    local_trace_request: Option<LocalTraceRequest>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -1730,6 +2236,7 @@ fn map_response_stream(
         api_stream,
         session_telemetry,
         inference_trace_attempt,
+        local_trace_request,
     )
 }
 
@@ -1738,6 +2245,7 @@ fn map_response_events<S>(
     api_stream: S,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
+    local_trace_request: Option<LocalTraceRequest>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1755,14 +2263,22 @@ where
         let mut logged_error = false;
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
+        let mut provider_stream_completed = false;
         let mut api_stream = api_stream;
         let upstream_request_id = upstream_request_id.as_deref();
+        let local_trace_request = local_trace_request.as_ref();
         if let Some(upstream_request_id) = upstream_request_id {
             feedback_tags!(last_model_request_id = upstream_request_id);
         }
         loop {
             let event = tokio::select! {
                 _ = consumer_dropped.cancelled() => {
+                    if let Some(trace_request) = local_trace_request {
+                        trace_request.finish_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                        );
+                    }
                     inference_trace_attempt.record_cancelled(
                         STREAM_DROPPED_REASON,
                         upstream_request_id,
@@ -1776,13 +2292,25 @@ where
                 break;
             };
             match event {
+                Ok(ResponseEvent::RawProviderEvent(raw_event)) => {
+                    if let Some(trace_request) = local_trace_request {
+                        trace_request.record_event(&ResponseEvent::RawProviderEvent(raw_event));
+                    }
+                }
                 Ok(ResponseEvent::OutputItemDone(item)) => {
+                    if let Some(trace_request) = local_trace_request {
+                        trace_request.record_event(&ResponseEvent::OutputItemDone(item.clone()));
+                    }
                     items_added.push(item.clone());
                     if tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(item)))
                         .await
                         .is_err()
                     {
+                        if let Some(trace_request) = local_trace_request {
+                            trace_request
+                                .finish_cancelled(STREAM_DROPPED_REASON, upstream_request_id);
+                        }
                         inference_trace_attempt.record_cancelled(
                             STREAM_DROPPED_REASON,
                             upstream_request_id,
@@ -1796,6 +2324,20 @@ where
                     token_usage,
                     end_turn,
                 }) => {
+                    provider_stream_completed = true;
+                    if let Some(trace_request) = local_trace_request {
+                        trace_request.record_event(&ResponseEvent::Completed {
+                            response_id: response_id.clone(),
+                            token_usage: token_usage.clone(),
+                            end_turn,
+                        });
+                        trace_request.record_completed(
+                            &response_id,
+                            upstream_request_id,
+                            token_usage.as_ref(),
+                            &items_added,
+                        );
+                    }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(
@@ -1831,7 +2373,14 @@ where
                     }
                 }
                 Ok(event) => {
+                    if let Some(trace_request) = local_trace_request {
+                        trace_request.record_event(&event);
+                    }
                     if tx_event.send(Ok(event)).await.is_err() {
+                        if let Some(trace_request) = local_trace_request {
+                            trace_request
+                                .finish_cancelled(STREAM_DROPPED_REASON, upstream_request_id);
+                        }
                         inference_trace_attempt.record_cancelled(
                             STREAM_DROPPED_REASON,
                             upstream_request_id,
@@ -1849,6 +2398,9 @@ where
                         feedback_tags!(last_model_request_id = upstream_request_id);
                     }
                     let mapped = map_api_error(err);
+                    if let Some(trace_request) = local_trace_request {
+                        trace_request.record_failed(&mapped.to_string(), upstream_request_id);
+                    }
                     inference_trace_attempt.record_failed(
                         &mapped,
                         upstream_request_id,
@@ -1864,11 +2416,19 @@ where
                 }
             }
         }
-        inference_trace_attempt.record_failed(
-            "stream closed before response.completed",
-            upstream_request_id,
-            &items_added,
-        );
+        if !provider_stream_completed {
+            inference_trace_attempt.record_failed(
+                "stream closed before response.completed",
+                upstream_request_id,
+                &items_added,
+            );
+            if let Some(trace_request) = local_trace_request {
+                trace_request.record_failed(
+                    "stream closed before response.completed",
+                    upstream_request_id,
+                );
+            }
+        }
     });
 
     (
@@ -1878,6 +2438,16 @@ where
         },
         rx_last_response,
     )
+}
+
+fn record_websocket_stream_request_failed(
+    trace_request: &Option<LocalTraceRequest>,
+    err: &CodexErr,
+    upstream_request_id: Option<&str>,
+) {
+    if let Some(trace_request) = trace_request {
+        trace_request.record_failed(&err.to_string(), upstream_request_id);
+    }
 }
 
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.

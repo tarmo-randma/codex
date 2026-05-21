@@ -70,6 +70,7 @@ pub struct MemorySummarizeOutput {
 
 #[derive(Debug)]
 pub enum ResponseEvent {
+    RawProviderEvent(Value),
     Created,
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),

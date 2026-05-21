@@ -6,6 +6,7 @@ use crate::session::Codex;
 use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
 use codex_features::Feature;
+use codex_local_trace::TraceRecorder;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
@@ -133,6 +134,12 @@ impl CodexThread {
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
     pub fn session_telemetry(&self) -> SessionTelemetry {
         self.codex.session.services.session_telemetry.clone()
+    }
+
+    /// Returns the session-local trace recorder so detached internal workers can keep their
+    /// background model requests in the same trace session.
+    pub fn local_trace_recorder(&self) -> TraceRecorder {
+        self.codex.session.services.local_trace_recorder.clone()
     }
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {

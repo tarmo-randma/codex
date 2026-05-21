@@ -1107,6 +1107,7 @@ impl SessionTelemetry {
 
     fn responses_type(event: &ResponseEvent) -> String {
         match event {
+            ResponseEvent::RawProviderEvent(_) => "raw_provider_event".into(),
             ResponseEvent::Created => "created".into(),
             ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
                 SessionTelemetry::responses_item_type(item)

@@ -284,6 +284,7 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         Arc::clone(&session),
         Arc::clone(&turn_context),
         tracker,
+        Arc::new(std::sync::Mutex::new(None)),
     );
     let item = assistant_output_text("original assistant text");
     let mut ctx = HandleOutputCtx {

@@ -193,6 +193,7 @@ use codex_protocol::exec_output::StreamOutput;
 
 mod config_lock;
 mod handlers;
+pub(crate) mod local_trace;
 mod mcp;
 mod multi_agents;
 mod review;
@@ -206,6 +207,7 @@ use self::config_lock::validate_config_lock_if_configured;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
+pub(crate) use self::local_trace::LocalTraceParent;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
@@ -411,6 +413,7 @@ pub(crate) struct CodexSpawnArgs {
     /// Root sessions and non-thread-spawn subagents pass a disabled context;
     /// `Session::new` creates the root trace itself when rollout tracing is enabled.
     pub(crate) parent_rollout_thread_trace: ThreadTraceContext,
+    pub(crate) local_trace_parent: Option<LocalTraceParent>,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
     pub(crate) environment_selections: ResolvedTurnEnvironments,
@@ -472,6 +475,7 @@ impl Codex {
             user_shell_override,
             inherited_exec_policy,
             parent_rollout_thread_trace,
+            local_trace_parent,
             parent_trace: _,
             environment_selections,
             analytics_events_client,
@@ -662,6 +666,7 @@ impl Codex {
             analytics_events_client,
             thread_store,
             parent_rollout_thread_trace,
+            local_trace_parent,
             attestation_provider,
         )
         .await

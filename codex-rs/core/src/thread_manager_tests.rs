@@ -19,6 +19,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
@@ -62,6 +63,193 @@ fn contextual_user_interrupted_marker() -> ResponseItem {
 fn developer_interrupted_marker() -> ResponseItem {
     interrupted_turn_history_marker(InterruptedTurnHistoryMarker::Developer)
         .expect("developer interrupted marker should be enabled")
+}
+
+#[tokio::test]
+async fn local_trace_session_start() {
+    let temp_dir = tempdir().expect("tempdir");
+    let trace_dir = temp_dir.path().join("traces");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+    let trace_config = trace_config_for_dir(&trace_dir);
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+
+    let new_thread = crate::session::local_trace::with_trace_config_for_tests(
+        trace_config,
+        Box::pin(async {
+            manager
+                .start_thread(config)
+                .await
+                .expect("start traced thread")
+        }),
+    )
+    .await;
+
+    let entries = trace_session_dirs(&trace_dir);
+    assert_eq!(entries.len(), 1);
+    let session_dir = &entries[0];
+    assert!(session_dir.join("manifest.json").is_file());
+    assert!(session_dir.join("session.json").is_file());
+    assert!(session_dir.join("config.json").is_file());
+    assert!(session_dir.join("requests/index.json").is_file());
+
+    new_thread
+        .thread
+        .codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown traced thread");
+}
+
+#[tokio::test]
+async fn local_trace_subagent_session() {
+    let temp_dir = tempdir().expect("tempdir");
+    let trace_dir = temp_dir.path().join("traces");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+    let trace_config = trace_config_for_dir(&trace_dir);
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let (parent, child) = crate::session::local_trace::with_trace_config_for_tests(
+        trace_config,
+        Box::pin(async {
+            let parent = manager
+                .start_thread(config.clone())
+                .await
+                .expect("start parent thread");
+            let options = StartThreadOptions {
+                config: config.clone(),
+                initial_history: InitialHistory::New,
+                session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: parent.thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: Some("agent-2".to_string()),
+                    agent_role: Some("worker".to_string()),
+                })),
+                thread_source: Some(ThreadSource::Subagent),
+                dynamic_tools: Vec::new(),
+                persist_extended_history: false,
+                metrics_service_name: None,
+                parent_trace: None,
+                environments: manager.default_environment_selections(&config.cwd),
+            };
+            let child = manager
+                .spawn_subagent(parent.thread_id, options)
+                .await
+                .expect("spawn subagent");
+            (parent, child)
+        }),
+    )
+    .await;
+
+    let entries = trace_session_dirs(&trace_dir);
+    assert_eq!(entries.len(), 1);
+    let parent_dir = &entries[0];
+    let spawn_entries = trace_json_files(&parent_dir.join("subagents"));
+    assert_eq!(spawn_entries.len(), 1);
+    let child_entries = trace_session_dirs(&parent_dir.join("subagent-sessions"));
+    assert_eq!(child_entries.len(), 1);
+    let child_dir = &child_entries[0];
+    assert!(child_dir.join("manifest.json").is_file());
+    assert!(child_dir.join("session.json").is_file());
+    assert!(child_dir.join("config.json").is_file());
+    assert!(child_dir.join("requests/index.json").is_file());
+
+    let child_session: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(child_dir.join("session.json")).unwrap())
+            .expect("child session json");
+    let child_relative_path = child_dir
+        .strip_prefix(parent_dir)
+        .expect("child relative to parent")
+        .to_string_lossy();
+    assert_eq!(
+        child_session
+            .get("parent_spawn_path")
+            .and_then(serde_json::Value::as_str),
+        Some(
+            spawn_entries[0]
+                .strip_prefix(parent_dir)
+                .expect("spawn relative to parent")
+                .to_string_lossy()
+                .trim_start_matches('/')
+        )
+    );
+    let spawn_record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&spawn_entries[0]).unwrap())
+            .expect("spawn json");
+    assert_eq!(
+        spawn_record
+            .pointer("/metadata/nested_trace_path")
+            .and_then(serde_json::Value::as_str),
+        Some(child_relative_path.as_ref())
+    );
+
+    child
+        .thread
+        .codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown child thread");
+    parent
+        .thread
+        .codex
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown parent thread");
+}
+
+fn trace_session_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn trace_config_for_dir(trace_dir: &std::path::Path) -> codex_local_trace::TraceConfig {
+    codex_local_trace::TraceConfig::from_env_map([
+        ("CODEX_TRACE".to_string(), "1".to_string()),
+        (
+            "CODEX_TRACE_DIR".to_string(),
+            trace_dir.to_string_lossy().to_string(),
+        ),
+    ])
+}
+
+fn trace_json_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    files
 }
 
 #[test]

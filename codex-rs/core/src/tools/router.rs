@@ -1,3 +1,4 @@
+use crate::client_local_trace::ModelRequestTraceContext;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -8,6 +9,7 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
+use codex_local_trace::recorder::TraceId;
 use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
@@ -19,6 +21,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_tools::ToolsConfig;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
@@ -124,6 +127,7 @@ impl ToolRouter {
     }
 
     #[instrument(level = "trace", skip_all, err)]
+    #[allow(dead_code)]
     pub async fn dispatch_tool_call_with_code_mode_result(
         &self,
         session: Arc<Session>,
@@ -132,6 +136,31 @@ impl ToolRouter {
         tracker: SharedTurnDiffTracker,
         call: ToolCall,
         source: ToolCallSource,
+    ) -> Result<AnyToolResult, FunctionCallError> {
+        self.dispatch_tool_call_with_code_mode_result_and_trace_started(
+            session,
+            turn,
+            cancellation_token,
+            tracker,
+            call,
+            source,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[instrument(level = "trace", skip_all, err)]
+    pub async fn dispatch_tool_call_with_code_mode_result_and_trace_started(
+        &self,
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        cancellation_token: CancellationToken,
+        tracker: SharedTurnDiffTracker,
+        call: ToolCall,
+        source: ToolCallSource,
+        trace_request_cell: Option<Arc<StdMutex<Option<TraceId>>>>,
+        model_request_trace_context: Option<ModelRequestTraceContext>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let ToolCall {
             tool_name,
@@ -150,7 +179,13 @@ impl ToolRouter {
             payload,
         };
 
-        self.registry.dispatch_any(invocation).await
+        self.registry
+            .dispatch_any_with_trace_started(
+                invocation,
+                trace_request_cell,
+                model_request_trace_context,
+            )
+            .await
     }
 }
 

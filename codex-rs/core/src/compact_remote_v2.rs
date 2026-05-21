@@ -24,6 +24,8 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
 use codex_features::Feature;
+use codex_local_trace::recorder::TraceOwner;
+use codex_local_trace::schema::OwnerMetadata;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -35,7 +37,6 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
 use futures::StreamExt;
-use futures::TryFutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -214,12 +215,17 @@ async fn run_remote_compact_task_inner_impl(
             &mut owned_client_session
         }
     };
+    let local_trace_owner = sess
+        .services
+        .local_trace_recorder
+        .start_compaction_call_scope(Some("compaction"), OwnerMetadata::default());
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
         turn_context,
         client_session,
         &prompt,
         turn_metadata_header.as_deref(),
+        local_trace_owner.as_ref(),
     )
     .await;
 
@@ -271,19 +277,39 @@ async fn run_remote_compaction_request_v2(
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     turn_metadata_header: Option<&str>,
+    local_trace_owner: Option<&TraceOwner>,
 ) -> CodexResult<(ResponseItem, String)> {
-    let stream = client_session
-        .stream(
-            prompt,
-            &turn_context.model_info,
-            &turn_context.session_telemetry,
-            turn_context.reasoning_effort,
-            turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
-            turn_metadata_header,
-            &InferenceTraceContext::disabled(),
-        )
-        .or_else(|err| async {
+    let stream_result = if let Some(owner) = local_trace_owner {
+        client_session
+            .stream_with_local_trace_owner(
+                prompt,
+                &turn_context.model_info,
+                &turn_context.session_telemetry,
+                turn_context.reasoning_effort,
+                turn_context.reasoning_summary,
+                turn_context.config.service_tier.clone(),
+                turn_metadata_header,
+                &InferenceTraceContext::disabled(),
+                owner.clone(),
+            )
+            .await
+    } else {
+        client_session
+            .stream(
+                prompt,
+                &turn_context.model_info,
+                &turn_context.session_telemetry,
+                turn_context.reasoning_effort,
+                turn_context.reasoning_summary,
+                turn_context.config.service_tier.clone(),
+                turn_metadata_header,
+                &InferenceTraceContext::disabled(),
+            )
+            .await
+    };
+    let stream = match stream_result {
+        Ok(stream) => stream,
+        Err(err) => {
             let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
             let compact_request_log_data =
                 build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
@@ -293,9 +319,9 @@ async fn run_remote_compaction_request_v2(
                 total_usage_breakdown,
                 &err,
             );
-            Err(err)
-        })
-        .await?;
+            return Err(err);
+        }
+    };
     collect_compaction_output(stream).await
 }
 

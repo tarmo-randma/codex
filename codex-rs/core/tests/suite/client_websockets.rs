@@ -46,6 +46,8 @@ use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -410,6 +412,229 @@ async fn responses_websocket_reuses_connection_with_per_turn_trace_payloads() {
         .as_str()
         .expect("missing second traceparent");
     assert_ne!(first_traceparent, second_traceparent);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_trace_records_incremental_payload_and_full_context() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "hi"),
+            ev_completed("resp-1"),
+        ],
+        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+    ]])
+    .await;
+    let trace_temp = TempDir::new().expect("trace temp dir");
+    let recorder = local_trace_recorder(trace_temp.path());
+    let session_path = recorder.session_path().expect("trace session path");
+    let harness = websocket_harness_with_provider_options_and_trace(
+        websocket_provider(&server),
+        false,
+        recorder,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt_one = prompt_with_input(vec![message_item("hello")]);
+    let prompt_two = prompt_with_input(vec![
+        message_item("hello"),
+        assistant_message_item("msg-1", "hi"),
+        message_item("again"),
+    ]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt_one).await;
+    stream_until_complete(&mut client_session, &harness, &prompt_two).await;
+
+    let records = trace_json(&session_path.join("requests/index.json"));
+    assert_eq!(records.as_array().expect("request records").len(), 2);
+    let first = &records[0];
+    assert_eq!(first["owner_scope"], "user_turn");
+    let first_owner_path = first["owner_path"].as_str().expect("first owner path");
+    assert!(first_owner_path.starts_with("turns/"));
+    assert!(
+        session_path
+            .join(first_owner_path)
+            .join("turn.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_to_string(session_path.join(first_owner_path).join("prompt.txt"))
+            .expect("read first prompt"),
+        "hello"
+    );
+    let second = &records[1];
+    assert_eq!(second["owner_scope"], "user_turn");
+    let second_owner_path = second["owner_path"].as_str().expect("second owner path");
+    assert!(second_owner_path.starts_with("turns/"));
+    assert!(
+        session_path
+            .join(second_owner_path)
+            .join("turn.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_to_string(session_path.join(second_owner_path).join("prompt.txt"))
+            .expect("read second prompt"),
+        "hello\n\nagain"
+    );
+    assert!(
+        second["request_path"]
+            .as_str()
+            .expect("second request path")
+            .starts_with(&format!("{second_owner_path}/requests/"))
+    );
+    let transport_payload =
+        trace_json(&session_path.join(second["request_path"].as_str().expect("request path")));
+    assert_eq!(transport_payload["previous_response_id"], "resp-1");
+    assert_eq!(
+        transport_payload["input"]
+            .as_array()
+            .expect("incremental input")
+            .len(),
+        1
+    );
+    let full_context_path = second["request_full_context_path"]
+        .as_str()
+        .expect("full context path");
+    let full_context = trace_json(&session_path.join(full_context_path));
+    assert!(full_context["previous_response_id"].is_null());
+    assert_eq!(
+        full_context["input"]
+            .as_array()
+            .expect("full context input")
+            .len(),
+        3
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_trace_marks_request_failed_when_stream_request_fails() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![Vec::new()],
+        response_headers: Vec::new(),
+        accept_delay: None,
+        close_after_requests: true,
+    }])
+    .await;
+    let trace_temp = TempDir::new().expect("trace temp dir");
+    let recorder = local_trace_recorder(trace_temp.path());
+    let session_path = recorder.session_path().expect("trace session path");
+    let harness = websocket_harness_with_provider_options_and_trace(
+        websocket_provider(&server),
+        false,
+        recorder,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort,
+            harness.summary,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
+        )
+        .await
+        .expect("websocket stream should be created before request failure is surfaced");
+
+    let mut saw_error = false;
+    while let Some(event) = stream.next().await {
+        if event.is_err() {
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "expected websocket stream request failure");
+
+    let records = trace_json(&session_path.join("requests/index.json"));
+    let records = records.as_array().expect("request records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "failed");
+    assert!(
+        records[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("response.completed"))
+    );
+    let request_path = records[0]["request_path"].as_str().expect("request path");
+    let meta = trace_json(&session_path.join(request_path).with_file_name("meta.json"));
+    assert_eq!(meta["status"], "failed");
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_trace_links_failed_request_retry() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![
+        vec![Vec::new()],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+    let trace_temp = TempDir::new().expect("trace temp dir");
+    let recorder = local_trace_recorder(trace_temp.path());
+    let session_path = recorder.session_path().expect("trace session path");
+    let harness = websocket_harness_with_provider_options_and_trace(
+        websocket_provider(&server),
+        false,
+        recorder,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+
+    let mut stream = client_session
+        .stream(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort,
+            harness.summary,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
+        )
+        .await
+        .expect("websocket stream should be created before request failure is surfaced");
+    let mut saw_error = false;
+    while let Some(event) = stream.next().await {
+        if event.is_err() {
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "expected first websocket stream to fail");
+
+    stream_until_complete(&mut client_session, &harness, &prompt).await;
+
+    let records = trace_json(&session_path.join("requests/index.json"));
+    let records = records.as_array().expect("request records");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["status"], "failed");
+    assert_eq!(records[0]["retry_attempt"], 1);
+    assert_eq!(records[1]["status"], "completed");
+    assert_eq!(records[1]["retry_attempt"], 2);
+    assert_eq!(
+        records[1]["previous_attempt_id"],
+        records[0]["trace_request_id"]
+    );
+    assert_eq!(
+        records[1]["previous_attempt_path"],
+        records[0]["request_path"]
+    );
 
     server.shutdown().await;
 }
@@ -1997,6 +2222,19 @@ async fn websocket_harness_with_provider_options(
     provider: ModelProviderInfo,
     runtime_metrics_enabled: bool,
 ) -> WebsocketTestHarness {
+    websocket_harness_with_provider_options_and_trace(
+        provider,
+        runtime_metrics_enabled,
+        codex_local_trace::TraceRecorder::disabled(),
+    )
+    .await
+}
+
+async fn websocket_harness_with_provider_options_and_trace(
+    provider: ModelProviderInfo,
+    runtime_metrics_enabled: bool,
+    trace_recorder: codex_local_trace::TraceRecorder,
+) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
     config.model = Some(MODEL.to_string());
@@ -2045,6 +2283,7 @@ async fn websocket_harness_with_provider_options(
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
         /*attestation_provider*/ None,
+        trace_recorder,
     );
 
     WebsocketTestHarness {
@@ -2057,6 +2296,28 @@ async fn websocket_harness_with_provider_options(
         summary,
         session_telemetry,
     }
+}
+
+fn local_trace_recorder(trace_dir: &Path) -> codex_local_trace::TraceRecorder {
+    codex_local_trace::TraceRecorder::start_session_at(
+        codex_local_trace::TraceConfig::from_env_map([
+            ("CODEX_TRACE".to_string(), "1".to_string()),
+            (
+                "CODEX_TRACE_DIR".to_string(),
+                trace_dir.to_string_lossy().to_string(),
+            ),
+        ]),
+        codex_local_trace::schema::SessionMetadata {
+            workspace_cwd: Some(trace_dir.to_path_buf()),
+            cwd: Some(trace_dir.to_path_buf()),
+            ..Default::default()
+        },
+    )
+}
+
+fn trace_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("read trace JSON"))
+        .expect("parse trace JSON")
 }
 
 async fn stream_until_complete(

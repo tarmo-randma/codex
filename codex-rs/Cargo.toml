@@ -55,6 +55,7 @@ members = [
     "file-watcher",
     "linux-sandbox",
     "lmstudio",
+    "local-trace",
     "login",
     "codex-mcp",
     "mcp-server",
@@ -178,6 +179,7 @@ codex-hooks = { path = "hooks" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
+codex-local-trace = { path = "local-trace" }
 codex-login = { path = "login" }
 codex-message-history = { path = "message-history" }
 codex-memories-extension = { path = "ext/memories" }

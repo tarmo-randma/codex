@@ -1,6 +1,9 @@
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::PoisonError;
 use std::time::Instant;
 
+use chrono::Local;
 use tokio::sync::RwLock;
 use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
@@ -9,17 +12,22 @@ use tracing::Instrument;
 use tracing::instrument;
 use tracing::trace_span;
 
+use crate::client_local_trace::ModelRequestTraceContext;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::AbortedToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
+use crate::tools::tool_call_trace::record_aborted_tool_call;
+use crate::tools::tool_call_trace::record_aborted_tool_call_result;
+use codex_local_trace::recorder::TraceId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 
@@ -30,6 +38,9 @@ pub(crate) struct ToolCallRuntime {
     turn_context: Arc<TurnContext>,
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
+    // Agent 4 consumes this to copy the model request trace id/path onto tool call metadata.
+    #[allow(dead_code)]
+    model_request_trace_context: Arc<StdMutex<Option<ModelRequestTraceContext>>>,
 }
 
 impl ToolCallRuntime {
@@ -38,6 +49,7 @@ impl ToolCallRuntime {
         session: Arc<Session>,
         turn_context: Arc<TurnContext>,
         tracker: SharedTurnDiffTracker,
+        model_request_trace_context: Arc<StdMutex<Option<ModelRequestTraceContext>>>,
     ) -> Self {
         Self {
             router,
@@ -45,7 +57,15 @@ impl ToolCallRuntime {
             turn_context,
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
+            model_request_trace_context,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn model_request_trace_context(
+        &self,
+    ) -> Arc<StdMutex<Option<ModelRequestTraceContext>>> {
+        Arc::clone(&self.model_request_trace_context)
     }
 
     pub(crate) fn create_diff_consumer(
@@ -89,6 +109,13 @@ impl ToolCallRuntime {
         let lock = Arc::clone(&self.parallel_execution);
         let invocation_cancellation_token = cancellation_token.clone();
         let started = Instant::now();
+        let trace_started_at = Local::now().naive_local();
+        let trace_request_cell = Arc::new(StdMutex::new(None::<TraceId>));
+        let model_request_trace_context = self
+            .model_request_trace_context()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call_with_code_mode_result",
@@ -104,7 +131,38 @@ impl ToolCallRuntime {
                     _ = cancellation_token.cancelled() => {
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         dispatch_span.record("aborted", true);
-                        Ok(Self::aborted_response(&call, secs))
+                        let result = Self::aborted_response(&call, secs);
+                        let invocation = ToolInvocation {
+                            session: Arc::clone(&session),
+                            turn: Arc::clone(&turn),
+                            cancellation_token: cancellation_token.clone(),
+                            tracker: Arc::clone(&tracker),
+                            call_id: call.call_id.clone(),
+                            tool_name: call.tool_name.clone(),
+                            source: source.clone(),
+                            payload: call.payload.clone(),
+                        };
+                        let trace_request = trace_request_cell
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone();
+                        if let Some(trace_request) = trace_request.as_ref() {
+                            record_aborted_tool_call_result(
+                                &invocation,
+                                &result,
+                                trace_started_at,
+                                trace_request,
+                                model_request_trace_context.as_ref(),
+                            );
+                        } else {
+                            record_aborted_tool_call(
+                                &invocation,
+                                &result,
+                                trace_started_at,
+                                model_request_trace_context.as_ref(),
+                            );
+                        }
+                        Ok(result)
                     },
                     res = async {
                         let _guard = if supports_parallel {
@@ -114,13 +172,15 @@ impl ToolCallRuntime {
                         };
 
                         router
-                            .dispatch_tool_call_with_code_mode_result(
-                                session,
-                                turn,
+                            .dispatch_tool_call_with_code_mode_result_and_trace_started(
+                                Arc::clone(&session),
+                                Arc::clone(&turn),
                                 invocation_cancellation_token,
-                                tracker,
+                                Arc::clone(&tracker),
                                 call.clone(),
-                                source,
+                                source.clone(),
+                                Some(Arc::clone(&trace_request_cell)),
+                                model_request_trace_context.clone(),
                             )
                             .instrument(dispatch_span.clone())
                             .await

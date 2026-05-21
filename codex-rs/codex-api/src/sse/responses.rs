@@ -436,13 +436,27 @@ pub async fn process_sse(
 
         trace!("SSE event: {}", &sse.data);
 
-        let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
+        let raw_event: serde_json::Value = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(e) => {
                 debug!("Failed to parse SSE event: {e}, data: {}", &sse.data);
                 continue;
             }
         };
+        let event: ResponsesStreamEvent = match serde_json::from_value(raw_event.clone()) {
+            Ok(event) => event,
+            Err(e) => {
+                debug!("Failed to parse SSE event: {e}, data: {}", &sse.data);
+                continue;
+            }
+        };
+        if tx_event
+            .send(Ok(ResponseEvent::RawProviderEvent(raw_event)))
+            .await
+            .is_err()
+        {
+            return;
+        }
         let model_verifications = event.model_verifications();
 
         if let Some(model) = event.response_model()
@@ -592,6 +606,9 @@ mod tests {
 
         let mut events = Vec::new();
         while let Some(ev) = rx.recv().await {
+            if matches!(ev, Ok(ResponseEvent::RawProviderEvent(_))) {
+                continue;
+            }
             events.push(ev);
         }
         events
@@ -623,7 +640,11 @@ mod tests {
 
         let mut out = Vec::new();
         while let Some(ev) = rx.recv().await {
-            out.push(ev.expect("channel closed"));
+            let event = ev.expect("channel closed");
+            if matches!(event, ResponseEvent::RawProviderEvent(_)) {
+                continue;
+            }
+            out.push(event);
         }
         out
     }
@@ -817,6 +838,9 @@ mod tests {
         let events = tokio::time::timeout(Duration::from_millis(1000), async {
             let mut events = Vec::new();
             while let Some(ev) = rx.recv().await {
+                if matches!(ev, Ok(ResponseEvent::RawProviderEvent(_))) {
+                    continue;
+                }
                 events.push(ev);
             }
             events

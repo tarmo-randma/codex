@@ -319,17 +319,15 @@ pub(crate) async fn run_turn(
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return None;
     }
+    let submitted_user_prompt = (!input.is_empty()).then(|| UserMessageItem::new(&input).message());
     let additional_contexts = if input.is_empty() {
         Vec::new()
     } else {
         let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input.clone());
         let response_item: ResponseItem = initial_input_for_turn.clone().into();
-        let user_prompt_submit_outcome = run_user_prompt_submit_hooks(
-            &sess,
-            &turn_context,
-            UserMessageItem::new(&input).message(),
-        )
-        .await;
+        let user_prompt_message = submitted_user_prompt.clone().unwrap_or_default();
+        let user_prompt_submit_outcome =
+            run_user_prompt_submit_hooks(&sess, &turn_context, user_prompt_message).await;
         if user_prompt_submit_outcome.should_stop {
             record_additional_contexts(
                 &sess,
@@ -372,6 +370,9 @@ pub(crate) async fn run_turn(
         sess.record_conversation_items(&turn_context, &plugin_items)
             .await;
     }
+    if let Some(prompt) = submitted_user_prompt.as_deref() {
+        client_session.start_local_trace_turn(prompt, Some(turn_context.sub_id.clone()));
+    }
 
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
@@ -403,6 +404,8 @@ pub(crate) async fn run_turn(
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
     let mut can_drain_pending_input = input.is_empty();
+    let mut local_trace_turn_status = codex_local_trace::schema::OwnerStatus::Completed;
+    let mut local_trace_turn_error = None;
 
     loop {
         if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -539,6 +542,13 @@ pub(crate) async fn run_turn(
                                     "failed to usage-limit active goal after usage-limit error: {err}"
                                 );
                             }
+                            local_trace_turn_status =
+                                codex_local_trace::schema::OwnerStatus::Failed;
+                            local_trace_turn_error = Some(err.to_string());
+                            client_session.finish_local_trace_turn(
+                                local_trace_turn_status,
+                                local_trace_turn_error,
+                            );
                             return None;
                         }
                     };
@@ -657,6 +667,8 @@ pub(crate) async fn run_turn(
                         }
                     }
                     if let Some(message) = abort_message {
+                        local_trace_turn_status = codex_local_trace::schema::OwnerStatus::Failed;
+                        local_trace_turn_error = Some(message.clone());
                         sess.send_event(
                             &turn_context,
                             EventMsg::Error(ErrorEvent {
@@ -665,6 +677,10 @@ pub(crate) async fn run_turn(
                             }),
                         )
                         .await;
+                        client_session.finish_local_trace_turn(
+                            local_trace_turn_status,
+                            local_trace_turn_error,
+                        );
                         return None;
                     }
                     break;
@@ -673,6 +689,8 @@ pub(crate) async fn run_turn(
             }
             Err(CodexErr::TurnAborted) => {
                 // Aborted turn is reported via a different event.
+                local_trace_turn_status = codex_local_trace::schema::OwnerStatus::Cancelled;
+                local_trace_turn_error = Some("turn aborted".to_string());
                 break;
             }
             Err(CodexErr::InvalidImageRequest()) => {
@@ -696,6 +714,8 @@ pub(crate) async fn run_turn(
             }
             Err(e) => {
                 info!("Turn error: {e:#}");
+                local_trace_turn_status = codex_local_trace::schema::OwnerStatus::Failed;
+                local_trace_turn_error = Some(e.to_string());
                 if e.to_codex_protocol_error() == CodexErrorInfo::UsageLimitExceeded
                     && let Err(err) = sess
                         .goal_runtime_apply(GoalRuntimeEvent::UsageLimitReached {
@@ -713,6 +733,7 @@ pub(crate) async fn run_turn(
         }
     }
 
+    client_session.finish_local_trace_turn(local_trace_turn_status, local_trace_turn_error);
     last_agent_message
 }
 
@@ -1081,6 +1102,7 @@ async fn run_sampling_request(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
+        client_session.shared_model_request_trace_context(),
     );
     let _code_mode_worker = sess
         .services
@@ -1090,6 +1112,7 @@ async fn run_sampling_request(
             &turn_context,
             Arc::clone(&router),
             Arc::clone(&turn_diff_tracker),
+            client_session.shared_model_request_trace_context(),
         )
         .await;
     let mut retries = 0;
@@ -1979,6 +2002,7 @@ async fn try_run_sampling_request(
         record_turn_ttft_metric(&turn_context, &event).await;
 
         match event {
+            ResponseEvent::RawProviderEvent(_) => {}
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()

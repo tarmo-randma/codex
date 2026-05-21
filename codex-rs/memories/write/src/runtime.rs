@@ -9,6 +9,7 @@ use codex_core::config::Config;
 use codex_core::content_items_to_text;
 use codex_core::resolve_installation_id;
 use codex_features::Feature;
+use codex_local_trace::schema::OwnerMetadata;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
@@ -172,6 +173,7 @@ impl MemoryStartupContext {
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let session_source = self.thread.config_snapshot().await.session_source;
+        let trace_recorder = self.thread.local_trace_recorder();
         let model_client = ModelClient::new(
             Some(Arc::clone(&self.auth_manager)),
             SessionId::from(self.thread_id), // We use thread_id to detach this query from the foreground user session.
@@ -184,21 +186,41 @@ impl MemoryStartupContext {
             config.features.enabled(Feature::RuntimeMetrics),
             /*beta_features_header*/ None,
             /*attestation_provider*/ None,
+            trace_recorder.clone(),
         );
 
         let mut client_session = model_client.new_session();
-        let mut stream = client_session
-            .stream(
-                prompt,
-                &context.model_info,
-                &context.session_telemetry,
-                context.reasoning_effort,
-                context.reasoning_summary,
-                context.service_tier.clone(),
-                context.turn_metadata_header.as_deref(),
-                &InferenceTraceContext::disabled(),
-            )
-            .await?;
+        let local_trace_owner = trace_recorder
+            .start_background_call_scope(Some("memory-stage-one"), OwnerMetadata::default());
+        let stream = if let Some(owner) = local_trace_owner {
+            client_session
+                .stream_with_local_trace_owner(
+                    prompt,
+                    &context.model_info,
+                    &context.session_telemetry,
+                    context.reasoning_effort,
+                    context.reasoning_summary,
+                    context.service_tier.clone(),
+                    context.turn_metadata_header.as_deref(),
+                    &InferenceTraceContext::disabled(),
+                    owner,
+                )
+                .await?
+        } else {
+            client_session
+                .stream(
+                    prompt,
+                    &context.model_info,
+                    &context.session_telemetry,
+                    context.reasoning_effort,
+                    context.reasoning_summary,
+                    context.service_tier.clone(),
+                    context.turn_metadata_header.as_deref(),
+                    &InferenceTraceContext::disabled(),
+                )
+                .await?
+        };
+        let mut stream = stream;
 
         let mut result = String::new();
         let mut token_usage = None;

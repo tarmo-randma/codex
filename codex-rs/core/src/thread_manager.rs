@@ -12,6 +12,8 @@ use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::LocalTraceParent;
+use crate::session::local_trace;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
@@ -65,6 +67,7 @@ use codex_thread_store::UpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -603,6 +606,7 @@ impl ThreadManager {
             options.parent_trace,
             options.environments,
             /*user_shell_override*/ None,
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -634,7 +638,56 @@ impl ThreadManager {
             history,
             InterruptedTurnHistoryMarker::from_config(&options.config),
         );
-        self.start_thread_with_options(options).await
+        let local_trace_parent = local_trace_parent_for_subagent(&fork_source, &options);
+        let session_source = options
+            .session_source
+            .unwrap_or_else(|| self.state.session_source.clone());
+        let thread_source = options
+            .thread_source
+            .or_else(|| options.initial_history.get_resumed_thread_source());
+        let environment_selections = resolve_environment_selections(
+            self.state.environment_manager.as_ref(),
+            &options.environments,
+        )?;
+        let parent_rollout_thread_trace = self
+            .state
+            .parent_rollout_thread_trace_for_source(&session_source, &options.initial_history)
+            .await;
+        let tracked_session_source = session_source.clone();
+        let CodexSpawnOk {
+            codex, thread_id, ..
+        } = Codex::spawn(CodexSpawnArgs {
+            config: options.config,
+            installation_id: self.state.installation_id.clone(),
+            auth_manager: Arc::clone(&self.state.auth_manager),
+            models_manager: Arc::clone(&self.state.models_manager),
+            environment_manager: Arc::clone(&self.state.environment_manager),
+            skills_manager: Arc::clone(&self.state.skills_manager),
+            plugins_manager: Arc::clone(&self.state.plugins_manager),
+            mcp_manager: Arc::clone(&self.state.mcp_manager),
+            extensions: Arc::clone(&self.state.extensions),
+            conversation_history: options.initial_history,
+            session_source,
+            thread_source,
+            agent_control: self.agent_control(),
+            dynamic_tools: options.dynamic_tools,
+            persist_extended_history: options.persist_extended_history,
+            metrics_service_name: options.metrics_service_name,
+            inherited_shell_snapshot: None,
+            inherited_exec_policy: None,
+            parent_rollout_thread_trace,
+            local_trace_parent,
+            user_shell_override: None,
+            parent_trace: options.parent_trace,
+            environment_selections,
+            analytics_events_client: self.state.analytics_events_client.clone(),
+            thread_store: Arc::clone(&self.state.thread_store),
+            attestation_provider: self.state.attestation_provider.clone(),
+        })
+        .await?;
+        self.state
+            .finalize_thread_spawn(codex, thread_id, tracked_session_source)
+            .await
     }
 
     pub async fn resume_thread_from_rollout(
@@ -680,6 +733,7 @@ impl ThreadManager {
             parent_trace,
             environments,
             /*user_shell_override*/ None,
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -705,6 +759,7 @@ impl ThreadManager {
             /*parent_trace*/ None,
             environments,
             /*user_shell_override*/ Some(user_shell_override),
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -734,6 +789,7 @@ impl ThreadManager {
             /*parent_trace*/ None,
             environments,
             /*user_shell_override*/ Some(user_shell_override),
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -894,6 +950,7 @@ impl ThreadManager {
             parent_trace,
             environments,
             /*user_shell_override*/ None,
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -1040,6 +1097,7 @@ impl ThreadManagerState {
             /*parent_trace*/ None,
             environments,
             /*user_shell_override*/ None,
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -1074,6 +1132,7 @@ impl ThreadManagerState {
             /*parent_trace*/ None,
             environments,
             /*user_shell_override*/ None,
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -1109,6 +1168,7 @@ impl ThreadManagerState {
             /*parent_trace*/ None,
             environments,
             /*user_shell_override*/ None,
+            /*local_trace_parent*/ None,
         ))
         .await
     }
@@ -1128,6 +1188,7 @@ impl ThreadManagerState {
         parent_trace: Option<W3cTraceContext>,
         environments: Vec<TurnEnvironmentSelection>,
         user_shell_override: Option<crate::shell::Shell>,
+        local_trace_parent: Option<LocalTraceParent>,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -1144,6 +1205,7 @@ impl ThreadManagerState {
             parent_trace,
             environments,
             user_shell_override,
+            local_trace_parent,
         ))
         .await
     }
@@ -1165,6 +1227,7 @@ impl ThreadManagerState {
         parent_trace: Option<W3cTraceContext>,
         environments: Vec<TurnEnvironmentSelection>,
         user_shell_override: Option<crate::shell::Shell>,
+        local_trace_parent: Option<LocalTraceParent>,
     ) -> CodexResult<NewThread> {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         if let InitialHistory::Resumed(resumed) = &initial_history {
@@ -1193,6 +1256,17 @@ impl ThreadManagerState {
         let parent_rollout_thread_trace = self
             .parent_rollout_thread_trace_for_source(&session_source, &initial_history)
             .await;
+        let local_trace_parent = match local_trace_parent {
+            Some(parent) => Some(parent),
+            None => {
+                self.local_trace_parent_for_session_source(
+                    &session_source,
+                    thread_source.as_ref(),
+                    &config,
+                )
+                .await
+            }
+        };
         let tracked_session_source = session_source.clone();
         let CodexSpawnOk {
             codex, thread_id, ..
@@ -1216,6 +1290,7 @@ impl ThreadManagerState {
             inherited_shell_snapshot,
             inherited_exec_policy,
             parent_rollout_thread_trace,
+            local_trace_parent,
             user_shell_override,
             parent_trace,
             environment_selections,
@@ -1312,6 +1387,80 @@ impl ThreadManagerState {
             .map(|thread| thread.codex.session.services.rollout_thread_trace.clone())
             .unwrap_or_else(codex_rollout_trace::ThreadTraceContext::disabled)
     }
+
+    async fn local_trace_parent_for_session_source(
+        &self,
+        session_source: &SessionSource,
+        thread_source: Option<&ThreadSource>,
+        config: &Config,
+    ) -> Option<LocalTraceParent> {
+        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id, ..
+        }) = session_source
+        else {
+            return None;
+        };
+        let parent_thread = self.get_thread(*parent_thread_id).await.ok()?;
+        let parent_recorder = parent_thread
+            .codex
+            .session
+            .services
+            .local_trace_recorder
+            .clone();
+        if !parent_recorder.is_enabled() {
+            return None;
+        }
+
+        local_trace::record_subagent_spawn(
+            &parent_recorder,
+            "subagent".to_string(),
+            &json!({
+                "session_source": session_source.to_string(),
+                "thread_source": thread_source.map(|source| format!("{source:?}")),
+                "cwd": config.cwd.to_string_lossy(),
+                "model": config.model.as_deref(),
+                "model_provider_id": config.model_provider_id.as_str(),
+            }),
+        )
+    }
+}
+
+fn local_trace_parent_for_subagent(
+    fork_source: &Arc<CodexThread>,
+    options: &StartThreadOptions,
+) -> Option<LocalTraceParent> {
+    let parent_recorder = fork_source
+        .codex
+        .session
+        .services
+        .local_trace_recorder
+        .clone();
+    if !parent_recorder.is_enabled() {
+        return None;
+    }
+    let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        agent_nickname,
+        agent_role,
+        ..
+    }) = options.session_source.as_ref()?
+    else {
+        return None;
+    };
+    let name = agent_nickname
+        .clone()
+        .or_else(|| agent_role.clone())
+        .unwrap_or_else(|| "subagent".to_string());
+    local_trace::record_subagent_spawn(
+        &parent_recorder,
+        name,
+        &json!({
+            "session_source": options.session_source.as_ref().map(std::string::ToString::to_string),
+            "thread_source": options.thread_source.as_ref().map(|source| format!("{source:?}")),
+            "cwd": options.config.cwd.to_string_lossy(),
+            "model": options.config.model.as_deref(),
+            "model_provider_id": options.config.model_provider_id.as_str(),
+        }),
+    )
 }
 
 fn stored_thread_to_initial_history(

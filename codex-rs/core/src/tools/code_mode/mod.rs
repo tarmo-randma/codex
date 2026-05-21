@@ -5,6 +5,7 @@ mod wait_handler;
 pub(crate) mod wait_spec;
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use codex_code_mode::CodeModeNestedToolCall;
@@ -17,6 +18,7 @@ use codex_protocol::models::ResponseInputItem;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
+use crate::client_local_trace::ModelRequestTraceContext;
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
 use crate::original_image_detail::sanitize_original_image_detail as sanitize_image_detail_items;
@@ -101,6 +103,7 @@ impl CodeModeService {
         turn: &Arc<TurnContext>,
         router: Arc<ToolRouter>,
         tracker: SharedTurnDiffTracker,
+        model_request_trace_context: Arc<StdMutex<Option<ModelRequestTraceContext>>>,
     ) -> Option<codex_code_mode::CodeModeTurnWorker> {
         if !turn.features.enabled(Feature::CodeMode) {
             return None;
@@ -110,8 +113,13 @@ impl CodeModeService {
             session: Arc::clone(session),
             turn: Arc::clone(turn),
         };
-        let tool_runtime =
-            ToolCallRuntime::new(router, Arc::clone(session), Arc::clone(turn), tracker);
+        let tool_runtime = ToolCallRuntime::new(
+            router,
+            Arc::clone(session),
+            Arc::clone(turn),
+            tracker,
+            model_request_trace_context,
+        );
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         Some(self.inner.start_turn_worker(host))
     }

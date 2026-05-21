@@ -700,6 +700,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(parent_exec_policy)),
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
+        local_trace_parent: None,
         user_shell_override: None,
         parent_trace: None,
         environment_selections: ResolvedTurnEnvironments {

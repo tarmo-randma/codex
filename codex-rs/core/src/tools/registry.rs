@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
+use crate::client_local_trace::ModelRequestTraceContext;
 use crate::function_tool::FunctionCallError;
 use crate::goals::GoalRuntimeEvent;
 use crate::hook_runtime::PreToolUseHookResult;
@@ -18,9 +21,14 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::flat_tool_name;
 use crate::tools::hook_names::HookToolName;
+use crate::tools::tool_call_trace::record_tool_call_failure;
+use crate::tools::tool_call_trace::record_tool_call_request;
+use crate::tools::tool_call_trace::record_tool_call_success;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
 use crate::tools::tool_search_entry::ToolSearchInfo;
 use crate::util::error_or_panic;
+use chrono::Local;
+use codex_local_trace::recorder::TraceId;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ToolName;
@@ -302,10 +310,36 @@ impl ToolRegistry {
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
     )]
+    #[allow(dead_code)]
     pub(crate) async fn dispatch_any(
         &self,
-        mut invocation: ToolInvocation,
+        invocation: ToolInvocation,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        self.dispatch_any_with_trace_started(invocation, None, None)
+            .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "tool dispatch must keep active-turn accounting atomic"
+    )]
+    pub(crate) async fn dispatch_any_with_trace_started(
+        &self,
+        mut invocation: ToolInvocation,
+        trace_request_cell: Option<Arc<StdMutex<Option<TraceId>>>>,
+        model_request_trace_context: Option<ModelRequestTraceContext>,
+    ) -> Result<AnyToolResult, FunctionCallError> {
+        let started_at = Local::now().naive_local();
+        let model_request_trace_context = model_request_trace_context.as_ref();
+        let trace_request =
+            record_tool_call_request(&invocation, started_at, model_request_trace_context);
+        if let Some(trace_request) = trace_request.as_ref()
+            && let Some(trace_request_cell) = trace_request_cell.as_ref()
+        {
+            *trace_request_cell
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(trace_request.clone());
+        }
         let tool_name = invocation.tool_name.clone();
         let tool_name_flat = flat_tool_name(&tool_name);
         let call_id_owned = invocation.call_id.clone();
@@ -355,6 +389,13 @@ impl ToolRegistry {
                 );
                 let err = FunctionCallError::RespondToModel(message);
                 dispatch_trace.record_failed(&err);
+                record_tool_call_failure(
+                    &invocation,
+                    started_at,
+                    trace_request.as_ref(),
+                    model_request_trace_context,
+                    &err,
+                );
                 return Err(err);
             }
         };
@@ -386,6 +427,13 @@ impl ToolRegistry {
             );
             let err = FunctionCallError::Fatal(message);
             dispatch_trace.record_failed(&err);
+            record_tool_call_failure(
+                &invocation,
+                started_at,
+                trace_request.as_ref(),
+                model_request_trace_context,
+                &err,
+            );
             return Err(err);
         }
 
@@ -402,12 +450,32 @@ impl ToolRegistry {
                 PreToolUseHookResult::Blocked(message) => {
                     let err = FunctionCallError::RespondToModel(message);
                     dispatch_trace.record_failed(&err);
+                    record_tool_call_failure(
+                        &invocation,
+                        started_at,
+                        trace_request.as_ref(),
+                        model_request_trace_context,
+                        &err,
+                    );
                     return Err(err);
                 }
                 PreToolUseHookResult::Continue {
                     updated_input: Some(updated_input),
                 } => {
-                    invocation = tool.with_updated_hook_input(invocation, updated_input)?;
+                    invocation =
+                        match tool.with_updated_hook_input(invocation.clone(), updated_input) {
+                            Ok(invocation) => invocation,
+                            Err(err) => {
+                                record_tool_call_failure(
+                                    &invocation,
+                                    started_at,
+                                    trace_request.as_ref(),
+                                    model_request_trace_context,
+                                    &err,
+                                );
+                                return Err(err);
+                            }
+                        };
                 }
                 PreToolUseHookResult::Continue {
                     updated_input: None,
@@ -517,19 +585,46 @@ impl ToolRegistry {
         match result {
             Ok(_) => {
                 let mut guard = response_cell.lock().await;
-                let result = guard.take().ok_or_else(|| {
-                    FunctionCallError::Fatal("tool produced no output".to_string())
-                })?;
+                let result = guard
+                    .take()
+                    .ok_or_else(|| FunctionCallError::Fatal("tool produced no output".to_string()));
+                let result = match result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        record_tool_call_failure(
+                            &invocation,
+                            started_at,
+                            trace_request.as_ref(),
+                            model_request_trace_context,
+                            &err,
+                        );
+                        return Err(err);
+                    }
+                };
                 dispatch_trace.record_completed(
                     &invocation,
                     &result.call_id,
                     &result.payload,
                     result.result.as_ref(),
                 );
+                record_tool_call_success(
+                    &invocation,
+                    started_at,
+                    trace_request.as_ref(),
+                    model_request_trace_context,
+                    &result,
+                );
                 Ok(result)
             }
             Err(err) => {
                 dispatch_trace.record_failed(&err);
+                record_tool_call_failure(
+                    &invocation,
+                    started_at,
+                    trace_request.as_ref(),
+                    model_request_trace_context,
+                    &err,
+                );
                 Err(err)
             }
         }
@@ -559,6 +654,7 @@ fn unsupported_tool_call_message(payload: &ToolPayload, tool_name: &ToolName) ->
         _ => format!("unsupported call: {tool_name}"),
     }
 }
+
 #[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;

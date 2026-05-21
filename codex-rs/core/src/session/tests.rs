@@ -406,6 +406,7 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*attestation_provider*/ None,
+        codex_local_trace::TraceRecorder::disabled(),
     )
     .new_session()
 }
@@ -546,7 +547,13 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
         },
     ));
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    ToolCallRuntime::new(router, session, turn_context, tracker)
+    ToolCallRuntime::new(
+        router,
+        session,
+        turn_context,
+        tracker,
+        Arc::new(std::sync::Mutex::new(None)),
+    )
 }
 
 fn make_connector(id: &str, name: &str) -> AppInfo {
@@ -4191,6 +4198,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
             /*state_db*/ None,
         )),
         codex_rollout_trace::ThreadTraceContext::disabled(),
+        /*local_trace_parent*/ None,
         /*attestation_provider*/ None,
     )
     .await;
@@ -4317,6 +4325,13 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             ..HooksConfig::default()
         })),
         rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
+        local_trace_recorder: super::local_trace::start_session_recorder(
+            &config,
+            &session_configuration,
+            thread_id,
+            "11111111-1111-4111-8111-111111111111",
+            None,
+        ),
         user_shell: Arc::new(default_user_shell()),
         shell_snapshot_tx: watch::channel(None).0,
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
@@ -4358,6 +4373,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
             /*attestation_provider*/ None,
+            codex_local_trace::TraceRecorder::disabled(),
         ),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -4535,6 +4551,7 @@ async fn make_session_with_config_and_rx(
             /*state_db*/ None,
         )),
         codex_rollout_trace::ThreadTraceContext::disabled(),
+        /*local_trace_parent*/ None,
         /*attestation_provider*/ None,
     )
     .await?;
@@ -4645,6 +4662,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
             ),
         )),
         codex_rollout_trace::ThreadTraceContext::disabled(),
+        /*local_trace_parent*/ None,
         /*attestation_provider*/ None,
     )
     .await?;
@@ -6176,6 +6194,13 @@ where
             ..HooksConfig::default()
         })),
         rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
+        local_trace_recorder: super::local_trace::start_session_recorder(
+            &config,
+            &session_configuration,
+            thread_id,
+            "11111111-1111-4111-8111-111111111111",
+            None,
+        ),
         user_shell: Arc::new(default_user_shell()),
         shell_snapshot_tx: watch::channel(None).0,
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
@@ -6217,6 +6242,7 @@ where
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
             /*attestation_provider*/ None,
+            codex_local_trace::TraceRecorder::disabled(),
         ),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),

@@ -20,6 +20,7 @@ codex-core = { workspace = true }
 codex-config = { workspace = true }
 codex-features = { workspace = true }
 codex-git-utils = { workspace = true }
+codex-local-trace = { workspace = true }
 codex-login = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }

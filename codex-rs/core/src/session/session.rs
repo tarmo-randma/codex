@@ -440,6 +440,7 @@ impl Session {
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
         parent_rollout_thread_trace: ThreadTraceContext,
+        local_trace_parent: Option<LocalTraceParent>,
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
@@ -622,6 +623,13 @@ impl Session {
             } else {
                 ThreadTraceContext::start_root_or_disabled(trace_metadata)
             };
+            let local_trace_recorder = super::local_trace::start_session_recorder(
+                &config,
+                &session_configuration,
+                thread_id,
+                &installation_id,
+                local_trace_parent,
+            );
 
             let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -903,6 +911,7 @@ impl Session {
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
                 rollout_thread_trace,
+                local_trace_recorder: local_trace_recorder.clone(),
                 user_shell: Arc::new(default_shell),
                 shell_snapshot_tx,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
@@ -940,6 +949,7 @@ impl Session {
                     config.features.enabled(Feature::RuntimeMetrics),
                     Self::build_model_client_beta_features_header(config.as_ref()),
                     attestation_provider,
+                    local_trace_recorder.clone(),
                 ),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(),
                 environment_manager,
